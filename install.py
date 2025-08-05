@@ -9,7 +9,8 @@ Requirements:
 - Always connect as SYSDBA using OS authentication
 - Change number input must start with 'CHG' (uppercase) and be exactly 10 characters
 - Directory: /tmp/changes/<CHANGE_NUMBER>
-- Log saved in script directory and filename must include CHANGE_NUMBER and timestamp
+- Single consolidated log saved in script directory, filename includes CHANGE_NUMBER and timestamp
+- Log contains start/end times for each .sql and total execution time of this script
 - ORACLE_SID environment variable must be set to the target SID before execution
 - Code and messages in English
 
@@ -23,12 +24,10 @@ import subprocess
 import time
 import argparse
 import sys
+from datetime import datetime
 
 
 def sorted_sql_files(directory):
-    """
-    Find all .sql files in 'directory' and return a list sorted by their leading numeric prefix.
-    """
     sql_paths = glob.glob(os.path.join(directory, '*.sql'))
     def extract_prefix(path):
         name = os.path.basename(path)
@@ -37,104 +36,105 @@ def sorted_sql_files(directory):
     return sorted(sql_paths, key=extract_prefix)
 
 
-def run_sql_file(sql_file, log_dir, change, timestamp):
-    """
-    Execute a single SQL file via sqlplus as SYSDBA, ensure PL/SQL blocks run even without trailing slash,
-    capture output and measure duration.
-    """
-    start_time = time.time()
-    sql_input = f"@{sql_file}\n/\nexit\n"
-    result = subprocess.run(
+def execute_sql(sql_file):
+    # Build input for sqlplus
+    has_slash = False
+    try:
+        with open(sql_file) as f:
+            has_slash = any(line.strip() == '/' for line in f)
+    except Exception:
+        pass
+    input_lines = [f"@{sql_file}"]
+    if not has_slash:
+        input_lines.append('/')
+    input_lines.append('exit')
+    return subprocess.run(
         ['sqlplus', '-s', '/ as sysdba'],
-        input=sql_input,
+        input='\n'.join(input_lines) + '\n',
         capture_output=True,
         text=True
     )
-    elapsed = time.time() - start_time
-
-    log_filename = f"{change}_{timestamp}_{os.path.basename(sql_file)}.log"
-    log_path = os.path.join(log_dir, log_filename)
-    os.makedirs(log_dir, exist_ok=True)
-    with open(log_path, 'w') as log_file:
-        log_file.write(result.stdout)
-        log_file.write(result.stderr)
-
-    print(f"{os.path.basename(sql_file)} executed in {elapsed:.2f}s (exit code {result.returncode})")
-    if result.returncode != 0:
-        print(f"Error executing {sql_file}. See log at {log_path}")
-    return result.returncode
 
 
 def validate_change(change_input):
-    """
-    Ensure change number starts with 'CHG' (uppercase) and is exactly 10 characters.
-    """
     return re.fullmatch(r'CHG\w{7}', change_input) is not None
 
 
-
 def main():
-    parser = argparse.ArgumentParser(
-        description='Execute .sql files in numeric order via sqlplus on AIX as SYSDBA'
-    )
+    parser = argparse.ArgumentParser(description='Execute .sql files in numeric order via sqlplus on AIX as SYSDBA')
     parser.add_argument('--sid', required=True, help='Oracle SID (e.g. ORCL)')
     parser.add_argument('--change', required=True, help="Change number (starts with 'CHG', 10 chars, uppercase)")
     parser.add_argument('--stop-on-error', action='store_true', help='Stop execution upon first error without prompt')
     args = parser.parse_args()
 
-    # Set ORACLE_SID environment
-    sid = args.sid
-    os.environ['ORACLE_SID'] = sid
-    print(f"ORACLE_SID set to {sid}")
+    # Set ORACLE_SID
+    os.environ['ORACLE_SID'] = args.sid
+    print(f"ORACLE_SID set to {args.sid}")
 
+    # Validate change
     change = args.change
     if not validate_change(change):
         print("Invalid change number. Must start with 'CHG' and be exactly 10 characters.")
-        choice = input("Abort execution? [y/N]: ").strip().lower()
-        if choice == 'y':
-            print("Aborting.")
+        if input("Abort execution? [y/N]: ").strip().lower() == 'y':
             sys.exit(1)
-        else:
-            print("Continuing with invalid change number.")
+        print("Continuing with invalid change number.")
 
+    # Directories and files
     sql_dir = os.path.join('/tmp/changes', change)
     if not os.path.isdir(sql_dir):
         print(f"Directory not found: {sql_dir}")
         sys.exit(1)
-
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    timestamp = time.strftime('%Y%m%d_%H%M%S')
 
-    # Gather and sort SQL files
-    sql_files = sorted_sql_files(sql_dir)
-    if not sql_files:
-        print(f"No .sql files found in {sql_dir}")
-        sys.exit(1)
+    # Prepare log
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_path = os.path.join(script_dir, f"{change}_{timestamp}_run.log")
+    with open(log_path, 'w') as log:
+        log.write(f"Script start: {datetime.now().isoformat()}\n")
 
-    # Preview files and confirm execution
-    print("Found the following SQL files in numeric order:")
-    for f in sql_files:
-        print(f"  {os.path.basename(f)}")
-    choice = input("Proceed with execution? [y/N]: ").strip().lower()
-    if choice != 'y':
-        print("Execution aborted by user.")
-        sys.exit(0)
+        # Gather files
+        sql_files = sorted_sql_files(sql_dir)
+        if not sql_files:
+            log.write(f"No .sql files found in {sql_dir}\n")
+            sys.exit(1)
+        log.write("Files to execute in order:\n")
+        for f in sql_files:
+            log.write(f"  {os.path.basename(f)}\n")
 
-    # Execute each file
-    for sql_file in sql_files:
-        rc = run_sql_file(sql_file, script_dir, change, timestamp)
-        if rc != 0:
-            if args.stop_on_error:
-                print("Aborting due to error.")
-                sys.exit(rc)
-            choice = input("Error encountered. Continue executing remaining scripts? [y/N]: ").strip().lower()
-            if choice != 'y':
-                print("Aborting as requested.")
-                sys.exit(rc)
-            else:
-                print("Continuing despite error.")
+        # Confirm execution
+        print("Found the following SQL files:")
+        for f in sql_files:
+            print(f"  {os.path.basename(f)}")
+        if input("Proceed with execution? [y/N]: ").strip().lower() != 'y':
+            log.write("Execution aborted by user.\n")
+            sys.exit(0)
 
-    print("All SQL files executed.")
+        overall_start = time.time()
+        for sql_file in sql_files:
+            file_start = datetime.now()
+            log.write(f"\n=== Executing {os.path.basename(sql_file)} at {file_start.isoformat()} ===\n")
+            result = execute_sql(sql_file)
+            file_end = datetime.now()
+            duration = (file_end - file_start).total_seconds()
+            log.write(result.stdout + result.stderr)
+            log.write(f"Exit code: {result.returncode}\n")
+            log.write(f"Completed at {file_end.isoformat()}, duration {duration:.2f}s\n")
+
+            print(f"{os.path.basename(sql_file)} executed in {duration:.2f}s (exit code {result.returncode})")
+            if result.returncode != 0:
+                if args.stop_on_error:
+                    log.write("Stopping due to error.\n")
+                    sys.exit(result.returncode)
+                if input("Error encountered. Continue? [y/N]: ").strip().lower() != 'y':
+                    log.write("Execution aborted by user after error.\n")
+                    sys.exit(result.returncode)
+
+        overall_end = time.time()
+        total_duration = overall_end - overall_start
+        log.write(f"\nScript end: {datetime.now().isoformat()}\n")
+        log.write(f"Total duration: {total_duration:.2f}s\n")
+
+    print(f"All SQL files executed. Consolidated log at {log_path}")
 
 if __name__ == '__main__':
     main()
