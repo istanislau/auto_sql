@@ -38,33 +38,38 @@ def sorted_sql_files(directory):
 
 def execute_sql(sql_file):
     """
-    Execute a single SQL file via sqlplus as SYSDBA.
-    Include SQL*Plus settings to suppress command echoing.
-    Detect if the file contains any standalone slash (/), to avoid missing PL/SQL block execution.
+    Execute a single SQL file via sqlplus as SYSDBA with minimal output.
+    Detect if the file's last non-empty line ends with ';' or is '/', to avoid duplicate execution.
+    Returns subprocess.CompletedProcess.
     """
-    # Detect any slash in file to know if PL/SQL blocks terminate inside
-    has_slash = False
+    # Read all lines to detect termination
+    lines = []
     try:
         with open(sql_file, 'r') as f:
-            for line in f:
-                if line.strip() == '/':
-                    has_slash = True
-                    break
+            lines = f.read().splitlines()
     except Exception:
         pass
+    # Determine if last statement should be re-executed
+    last = ''
+    for line in reversed(lines):
+        if line.strip():
+            last = line.strip()
+            break
+    # Only append slash if last line is not '/' and does not end with ';'
+    append_slash = not (last == '/' or last.endswith(';'))
 
-    # Prepare SQL*Plus input with settings
-    input_lines = [
+    # Prepare SQL*Plus commands
+    commands = [
         'SET ECHO OFF',
         'SET FEEDBACK OFF',
         'SET VERIFY OFF',
         'SET SERVEROUTPUT ON SIZE UNLIMITED',
         f"@{sql_file}"
     ]
-    if not has_slash:
-        input_lines.append('/')
-    input_lines.append('exit')
-    sql_input = '\n'.join(input_lines) + '\n'
+    if append_slash:
+        commands.append('/')
+    commands.append('EXIT')
+    sql_input = '\n'.join(commands) + '\n'
 
     return subprocess.run(
         ['sqlplus', '-s', '/ as sysdba'],
@@ -72,6 +77,14 @@ def execute_sql(sql_file):
         capture_output=True,
         text=True
     )
+
+
+def result_has_error(result):
+    """
+    Determine if sqlplus output indicates a SQL error.
+    """
+    text = (result.stdout or '') + (result.stderr or '')
+    return bool(re.search(r"ERROR at line|ORA-\d+|SP2-", text))
 
 
 def validate_change(change_input):
@@ -84,14 +97,14 @@ def main():
     )
     parser.add_argument('--sid', required=True, help='Oracle SID (e.g. ORCL)')
     parser.add_argument('--change', required=True, help="Change number (starts with 'CHG', 10 chars, uppercase)")
-    parser.add_argument('--stop-on-error', action='store_true', help='Stop execution upon first error without prompt')
+    parser.add_argument('--stop-on-error', action='store_true', help='Stop on first SQL error without prompt')
     args = parser.parse_args()
 
     # Set ORACLE_SID
     os.environ['ORACLE_SID'] = args.sid
     print(f"ORACLE_SID set to {args.sid}")
 
-    # Validate change
+    # Validate change number
     change = args.change
     if not validate_change(change):
         print("Invalid change number. Must start with 'CHG' and be exactly 10 characters.")
@@ -99,21 +112,21 @@ def main():
             sys.exit(1)
         print("Continuing with invalid change number.")
 
-    # Directories
+    # Paths
     sql_dir = os.path.join('/tmp/changes', change)
     if not os.path.isdir(sql_dir):
         print(f"Directory not found: {sql_dir}")
         sys.exit(1)
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Prepare consolidated log
+    # Consolidated log
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_file = os.path.join(script_dir, f"{change}_{timestamp}_run.log")
 
     with open(log_file, 'w') as log:
         log.write(f"Script start: {datetime.now().isoformat()}\n")
 
-        # Gather and list files
+        # List files
         sql_files = sorted_sql_files(sql_dir)
         if not sql_files:
             log.write(f"No .sql files found in {sql_dir}\n")
@@ -122,7 +135,7 @@ def main():
         for f in sql_files:
             log.write(f"  {os.path.basename(f)}\n")
 
-        # Confirm in console
+        # Confirm
         print("Found the following SQL files:")
         for f in sql_files:
             print(f"  {os.path.basename(f)}")
@@ -132,7 +145,7 @@ def main():
 
         overall_start = time.time()
 
-        # Execute each script
+        # Execute each
         for sql_file in sql_files:
             file_start = datetime.now()
             log.write(f"\n=== Executing {os.path.basename(sql_file)} at {file_start.isoformat()} ===\n")
@@ -140,17 +153,17 @@ def main():
             file_end = datetime.now()
             duration = (file_end - file_start).total_seconds()
 
-            # Write output
             log.write(result.stdout)
             log.write(result.stderr)
-            log.write(f"Exit code: {result.returncode}\n")
+            error_occurred = result.returncode != 0 or result_has_error(result)
+            log.write(f"Exit code: {result.returncode}, SQL error: {error_occurred}\n")
             log.write(f"Completed at {file_end.isoformat()}, duration {duration:.2f}s\n")
 
-            print(f"{os.path.basename(sql_file)} executed in {duration:.2f}s (exit code {result.returncode})")
-            if result.returncode != 0:
-                log.write("Stopping due to error.\n")
+            print(f"{os.path.basename(sql_file)} executed in {duration:.2f}s (error: {error_occurred})")
+            if error_occurred:
+                log.write("Error detected.\n")
                 if args.stop_on_error or input("Error encountered. Continue? [y/N]: ").strip().lower() != 'y':
-                    sys.exit(result.returncode)
+                    sys.exit(result.returncode or 1)
                 log.write("Continuing after error.\n")
 
         overall_end = time.time()
