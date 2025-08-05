@@ -37,17 +37,27 @@ def sorted_sql_files(directory):
 
 
 def execute_sql(sql_file):
-    # Build input for sqlplus
+    """
+    Execute a single SQL file via sqlplus as SYSDBA.
+    Detect if the file's last non-empty line is '/', to avoid duplicate execution of PL/SQL blocks.
+    """
+    # Detect trailing slash in file
     has_slash = False
     try:
-        with open(sql_file) as f:
-            has_slash = any(line.strip() == '/' for line in f)
+        with open(sql_file, 'r') as f:
+            lines = f.read().splitlines()
+        for line in reversed(lines):
+            if line.strip():
+                has_slash = (line.strip() == '/')
+                break
     except Exception:
         pass
+
     input_lines = [f"@{sql_file}"]
     if not has_slash:
         input_lines.append('/')
     input_lines.append('exit')
+
     return subprocess.run(
         ['sqlplus', '-s', '/ as sysdba'],
         input='\n'.join(input_lines) + '\n',
@@ -61,7 +71,9 @@ def validate_change(change_input):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Execute .sql files in numeric order via sqlplus on AIX as SYSDBA')
+    parser = argparse.ArgumentParser(
+        description='Execute .sql files in numeric order via sqlplus on AIX as SYSDBA'
+    )
     parser.add_argument('--sid', required=True, help='Oracle SID (e.g. ORCL)')
     parser.add_argument('--change', required=True, help="Change number (starts with 'CHG', 10 chars, uppercase)")
     parser.add_argument('--stop-on-error', action='store_true', help='Stop execution upon first error without prompt')
@@ -79,20 +91,21 @@ def main():
             sys.exit(1)
         print("Continuing with invalid change number.")
 
-    # Directories and files
+    # Directories
     sql_dir = os.path.join('/tmp/changes', change)
     if not os.path.isdir(sql_dir):
         print(f"Directory not found: {sql_dir}")
         sys.exit(1)
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Prepare log
+    # Prepare consolidated log
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_path = os.path.join(script_dir, f"{change}_{timestamp}_run.log")
-    with open(log_path, 'w') as log:
+    log_file = os.path.join(script_dir, f"{change}_{timestamp}_run.log")
+
+    with open(log_file, 'w') as log:
         log.write(f"Script start: {datetime.now().isoformat()}\n")
 
-        # Gather files
+        # Gather and list files
         sql_files = sorted_sql_files(sql_dir)
         if not sql_files:
             log.write(f"No .sql files found in {sql_dir}\n")
@@ -101,7 +114,7 @@ def main():
         for f in sql_files:
             log.write(f"  {os.path.basename(f)}\n")
 
-        # Confirm execution
+        # Confirm
         print("Found the following SQL files:")
         for f in sql_files:
             print(f"  {os.path.basename(f)}")
@@ -110,31 +123,34 @@ def main():
             sys.exit(0)
 
         overall_start = time.time()
+
+        # Execute each script
         for sql_file in sql_files:
             file_start = datetime.now()
             log.write(f"\n=== Executing {os.path.basename(sql_file)} at {file_start.isoformat()} ===\n")
             result = execute_sql(sql_file)
             file_end = datetime.now()
             duration = (file_end - file_start).total_seconds()
-            log.write(result.stdout + result.stderr)
+
+            # Write output
+            log.write(result.stdout)
+            log.write(result.stderr)
             log.write(f"Exit code: {result.returncode}\n")
             log.write(f"Completed at {file_end.isoformat()}, duration {duration:.2f}s\n")
 
             print(f"{os.path.basename(sql_file)} executed in {duration:.2f}s (exit code {result.returncode})")
             if result.returncode != 0:
-                if args.stop_on_error:
-                    log.write("Stopping due to error.\n")
+                log.write("Stopping due to error.\n")
+                if args.stop_on_error or input("Error encountered. Continue? [y/N]: ").strip().lower() != 'y':
                     sys.exit(result.returncode)
-                if input("Error encountered. Continue? [y/N]: ").strip().lower() != 'y':
-                    log.write("Execution aborted by user after error.\n")
-                    sys.exit(result.returncode)
+                log.write("Continuing after error.\n")
 
         overall_end = time.time()
         total_duration = overall_end - overall_start
         log.write(f"\nScript end: {datetime.now().isoformat()}\n")
         log.write(f"Total duration: {total_duration:.2f}s\n")
 
-    print(f"All SQL files executed. Consolidated log at {log_path}")
+    print(f"All SQL files executed. Consolidated log at {log_file}")
 
 if __name__ == '__main__':
     main()
