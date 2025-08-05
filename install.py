@@ -10,10 +10,11 @@ Requirements:
 - Change number input must start with 'CHG' (uppercase) and be exactly 10 characters
 - Directory: /tmp/changes/<CHANGE_NUMBER>
 - Log saved in script directory and filename must include CHANGE_NUMBER and timestamp
+- ORACLE_SID environment variable must be set to the target SID before execution
 - Code and messages in English
 
 Usage:
-    python3 install.py --change CHG1234567 [--stop-on-error]
+    python exec_sqls.py --sid ORCL --change CHG1234567 [--stop-on-error]
 """
 import os
 import re
@@ -38,15 +39,22 @@ def sorted_sql_files(directory):
 
 def run_sql_file(sql_file, log_dir, change, timestamp):
     """
-    Execute a single SQL file via sqlplus as SYSDBA, capture output and measure duration.
+    Execute a single SQL file via sqlplus as SYSDBA, ensure PL/SQL blocks run even without trailing slash,
+    capture output and measure duration.
     """
     start_time = time.time()
-    cmd = ['sqlplus', '-s', '/ as sysdba', '@' + sql_file]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    sql_input = f"@{sql_file}\n/\nexit\n"
+    result = subprocess.run(
+        ['sqlplus', '-s', '/ as sysdba'],
+        input=sql_input,
+        capture_output=True,
+        text=True
+    )
     elapsed = time.time() - start_time
 
     log_filename = f"{change}_{timestamp}_{os.path.basename(sql_file)}.log"
     log_path = os.path.join(log_dir, log_filename)
+    os.makedirs(log_dir, exist_ok=True)
     with open(log_path, 'w') as log_file:
         log_file.write(result.stdout)
         log_file.write(result.stderr)
@@ -64,11 +72,20 @@ def validate_change(change_input):
     return re.fullmatch(r'CHG\w{7}', change_input) is not None
 
 
+
 def main():
-    parser = argparse.ArgumentParser(description='Execute .sql files in numeric order via sqlplus on AIX as SYSDBA')
+    parser = argparse.ArgumentParser(
+        description='Execute .sql files in numeric order via sqlplus on AIX as SYSDBA'
+    )
+    parser.add_argument('--sid', required=True, help='Oracle SID (e.g. ORCL)')
     parser.add_argument('--change', required=True, help="Change number (starts with 'CHG', 10 chars, uppercase)")
     parser.add_argument('--stop-on-error', action='store_true', help='Stop execution upon first error without prompt')
     args = parser.parse_args()
+
+    # Set ORACLE_SID environment
+    sid = args.sid
+    os.environ['ORACLE_SID'] = sid
+    print(f"ORACLE_SID set to {sid}")
 
     change = args.change
     if not validate_change(change):
