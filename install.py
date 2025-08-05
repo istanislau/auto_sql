@@ -39,28 +39,36 @@ def sorted_sql_files(directory):
 def execute_sql(sql_file):
     """
     Execute a single SQL file via sqlplus as SYSDBA.
-    Detect if the file's last non-empty line is '/', to avoid duplicate execution of PL/SQL blocks.
+    Include SQL*Plus settings to suppress command echoing.
+    Detect if the file contains any standalone slash (/), to avoid missing PL/SQL block execution.
     """
-    # Detect trailing slash in file
+    # Detect any slash in file to know if PL/SQL blocks terminate inside
     has_slash = False
     try:
         with open(sql_file, 'r') as f:
-            lines = f.read().splitlines()
-        for line in reversed(lines):
-            if line.strip():
-                has_slash = (line.strip() == '/')
-                break
+            for line in f:
+                if line.strip() == '/':
+                    has_slash = True
+                    break
     except Exception:
         pass
 
-    input_lines = [f"@{sql_file}"]
+    # Prepare SQL*Plus input with settings
+    input_lines = [
+        'SET ECHO OFF',
+        'SET FEEDBACK OFF',
+        'SET VERIFY OFF',
+        'SET SERVEROUTPUT ON SIZE UNLIMITED',
+        f"@{sql_file}"
+    ]
     if not has_slash:
         input_lines.append('/')
     input_lines.append('exit')
+    sql_input = '\n'.join(input_lines) + '\n'
 
     return subprocess.run(
         ['sqlplus', '-s', '/ as sysdba'],
-        input='\n'.join(input_lines) + '\n',
+        input=sql_input,
         capture_output=True,
         text=True
     )
@@ -114,7 +122,7 @@ def main():
         for f in sql_files:
             log.write(f"  {os.path.basename(f)}\n")
 
-        # Confirm
+        # Confirm in console
         print("Found the following SQL files:")
         for f in sql_files:
             print(f"  {os.path.basename(f)}")
